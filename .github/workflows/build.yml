@@ -2,11 +2,7 @@ name: Build Tor for OpenWrt 25.12.4 (bcm2711 aarch64-musl) - self-contained
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 1 * *"   # 03:00 UTC on the 1st of each month
-
-permissions:
-  contents: write
+  push:
 
 env:
   OPENWRT_VERSION: 25.12.4
@@ -25,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo add-apt-repository universe 
           sudo apt-get update 
-          sudo apt-get install -y xz-utils ca-certificates curl build-essential git python3 python3-venv python3-pip zstd
+          sudo apt-get install -y xz-utils ca-certificates curl build-essential git python3 python3-venv python3-pip zstd file
           python3 -m pip install --upgrade setuptools wheel
 
       - name: Find and extract SDK
@@ -68,6 +64,26 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
 
+      - name: Create minimal .config for SDK
+        run: |
+          cd /tmp/$SDK_DIR
+          # Create a minimal .config file to avoid interactive menuconfig
+          cat > .config <<'EOF'
+          CONFIG_TARGET_bcm27xx=y
+          CONFIG_TARGET_bcm27xx_bcm2711=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_ALL_PROFILES=y
+          CONFIG_DEVEL=y
+          CONFIG_KERNEL_KALLSYMS=y
+          CONFIG_KERNEL_PROFILING=y
+          CONFIG_KERNEL_ELF_CORE=y
+          CONFIG_IPV6=y
+          CONFIG_PACKAGE_tor-local=y
+          EOF
+          
+          # Run defconfig to resolve dependencies
+          make defconfig
+
       - name: Create local tor package
         run: |
           SDK="/tmp/$SDK_DIR"
@@ -77,59 +93,53 @@ jobs:
           include $(TOPDIR)/rules.mk
           
           PKG_NAME:=tor
-          PKG_VERSION:=$(PKG_VERSION_FROM_LATEST)
+          PKG_VERSION:=0.4.8.12
           PKG_RELEASE:=1
+          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
           PKG_SOURCE_URL:=https://dist.torproject.org
+          PKG_HASH:=skip
+          
+          PKG_BUILD_DEPENDS:=libopenssl
+          PKG_INSTALL:=1
+          
+          include $(INCLUDE_DIR)/package.mk
           
           define Package/tor
             SECTION:=net
             CATEGORY:=Network
             TITLE:=Tor - onion routing daemon
-            DEPENDS:=+libpthread +libopenssl
+            DEPENDS:=+libopenssl +libpthread
+            URL:=https://www.torproject.org
           endef
           
-          define Build/Prepare
-            mkdir -p $(PKG_BUILD_DIR)
-            if [ -z "$${TOR_VER_FROM_ENV}" ] || [ "$${TOR_VER_FROM_ENV}" = "latest" ]; then \
-              echo "Fetching latest tor version..."; \
-              latest=$$(curl -fsS https://dist.torproject.org/ | grep -oP 'tor-[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz' | sort -V | tail -n1); \
-              tarball="$${latest}"; \
-              version=$$(echo "$${latest}" | sed 's/tor-//' | sed 's/\.tar\.gz//'); \
-            else \
-              tarball="tor-$${TOR_VER_FROM_ENV}.tar.gz"; \
-              version="$${TOR_VER_FROM_ENV}"; \
-            fi; \
-            echo "Using tor version: $${version}"; \
-            echo "Downloading $${tarball}"; \
-            wget -q "https://dist.torproject.org/$${tarball}" -O "$(DL_DIR)/$${tarball}"; \
-            tar -xzf "$(DL_DIR)/$${tarball}" -C $(PKG_BUILD_DIR) --strip-components=1; \
-            echo "$${version}" > $(PKG_BUILD_DIR)/.version; \
+          define Package/tor/description
+            Tor is a toolset for a wide range of organizations and people that want
+            to improve their safety and security on the Internet.
           endef
           
           define Build/Configure
-            cd $(PKG_BUILD_DIR); \
-            ./configure --host=$(ARCH)-openwrt-linux-musl --disable-asciidoc --disable-system-torrc --disable-unittests
-          endef
-          
-          define Build/Compile
-            $(MAKE) -C $(PKG_BUILD_DIR) -j$(JOBS)
+            (cd $(PKG_BUILD_DIR); \
+              ./configure \
+                --host=$(GNU_TARGET_NAME) \
+                --build=$(GNU_HOST_NAME) \
+                --disable-asciidoc \
+                --disable-system-torrc \
+                --disable-unittests \
+                --without-libevent \
+                --with-openssl-dir=$(STAGING_DIR)/usr \
+            )
           endef
           
           define Package/tor/install
             $(INSTALL_DIR) $(1)/usr/bin
-            $(INSTALL_BIN) $(PKG_BUILD_DIR)/src/app/tor $(1)/usr/bin/tor
+            $(INSTALL_BIN) $(PKG_BUILD_DIR)/src/app/tor $(1)/usr/bin/
             $(INSTALL_DIR) $(1)/etc/tor
             $(INSTALL_DATA) $(PKG_BUILD_DIR)/src/config/torrc.sample $(1)/etc/tor/torrc.sample
-          endef
-          
-          define Package/tor/conffiles
-          /etc/tor/torrc.sample
           endef
           
           $(eval $(call BuildPackage,tor))
           EOF
           
-          # ensure the package is properly registered
           echo "Package directory created at $SDK/package/tor-local"
           ls -la "$SDK/package/tor-local"
 
@@ -138,8 +148,6 @@ jobs:
           cd /tmp/$SDK_DIR
           ./scripts/feeds update -a
           ./scripts/feeds install -a || true
-          # make sure our local package is recognized
-          make package/tor-local/clean V=s || true
 
       - name: Build tor package
         run: |
@@ -147,6 +155,11 @@ jobs:
           cd /tmp/$SDK_DIR
           export TOR_VER_FROM_ENV="${TOR_VERSION}"
           export JOBS="${JOBS}"
+          # Make sure dependencies are built first
+          make package/tor-local/clean V=s || true
+          make tools/install V=s
+          make toolchain/install V=s
+          make target/compile V=s
           make package/tor-local/compile V=s
 
       - name: Collect artifacts
