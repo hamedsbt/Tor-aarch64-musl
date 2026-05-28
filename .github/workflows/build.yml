@@ -21,7 +21,9 @@ jobs:
           sudo apt-get update
           sudo add-apt-repository universe 
           sudo apt-get update 
-          sudo apt-get install -y python3-distutils
+          sudo apt-get install -y xz-utils ca-certificates curl build-essential git python3 python3-venv python3-pip
+          python3 -m pip install --upgrade setuptools wheel
+
 
       - name: Find SDK tarball URL
         id: find_sdk
