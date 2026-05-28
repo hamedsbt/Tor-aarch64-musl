@@ -1,0 +1,136 @@
+name: Build Tor for OpenWrt 25.12.4 (bcm2711 aarch64-musl) - self-contained
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  OPENWRT_VERSION: 25.12.4
+  TARGET_DIR: bcm27xx/bcm2711
+  JOBS: 2
+  TOR_VERSION: latest   # set to a specific version like "0.4.8.11" to pin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils ca-certificates curl git build-essential python3 python3-distutils
+
+      - name: Find SDK tarball URL
+        id: find_sdk
+        run: |
+          SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
+          echo "Index: $SDK_INDEX"
+          html=$(curl -fsS "$SDK_INDEX")
+          # find an SDK tarball for aarch64 with musl, Linux-x86_64
+          sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*aarch64[^"]*musl[^"]*Linux-x86_64.tar.xz' | head -n1)
+          if [ -z "$sdkfile" ]; then
+            echo "No matching SDK file found at $SDK_INDEX" >&2
+            exit 1
+          fi
+          sdkurl="${SDK_INDEX}${sdkfile}"
+          echo "sdkurl=$sdkurl" >> "$GITHUB_OUTPUT"
+
+      - name: Download & extract SDK
+        id: extract_sdk
+        run: |
+          sdkurl=${{ steps.find_sdk.outputs.sdkurl }}
+          echo "Downloading $sdkurl"
+          curl -fsSL "$sdkurl" -o /tmp/openwrt-sdk.tar.xz
+          tar -xJf /tmp/openwrt-sdk.tar.xz -C /tmp
+          SDK_DIR=$(tar -tf /tmp/openwrt-sdk.tar.xz | head -n1 | cut -f1 -d"/")
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+          ls -l /tmp/$SDK_DIR
+
+      - name: Cache downloads and build_dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/${{ env.SDK_DIR }}/dl
+            /tmp/${{ env.SDK_DIR }}/build_dir
+          key: openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-v1
+          restore-keys: |
+            openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
+
+      - name: Create local tor package (auto-fetch latest if requested)
+        run: |
+          SDK="/tmp/$SDK_DIR"
+          mkdir -p "$SDK/package/tor-local"
+          cat > "$SDK/package/tor-local/Makefile" <<'EOF'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=tor
+          PKG_VERSION:=$(if $(strip $(TOR_VER_FROM_ENV)),$(TOR_VER_FROM_ENV),$(PKG_VERSION_FROM_LATEST))
+          PKG_RELEASE:=1
+          PKG_SOURCE_URL:=https://dist.torproject.org
+          # set PKG_VERSION_FROM_LATEST by fetching latest stable filename (only used when TOR_VER_FROM_ENV is empty)
+          define Package/tor
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=Tor - onion routing daemon
+            DEPENDS:=+libpthread +libssl
+          endef
+          define Build/Prepare
+            mkdir -p $(PKG_BUILD_DIR)
+            if [ -z "$(TOR_VER_FROM_ENV)" ]; then \
+              # fetch the latest tarball name from torproject dist listing
+              latest=$(curl -fsS https://dist.torproject.org/ | grep -oP 'tor-[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz' | sort -V | tail -n1); \
+              tarball=$${latest}; \
+            else \
+              tarball="tor-$(TOR_VER_FROM_ENV).tar.gz"; \
+            fi; \
+            echo "Using $${tarball}"; \
+            wget -q https://dist.torproject.org/$${tarball} -O $(DL_DIR)/$${tarball}; \
+            tar -xzf $(DL_DIR)/$${tarball} -C $(PKG_BUILD_DIR) --strip-components=1; \
+          endef
+          define Build/Configure
+            # no-op; use upstream build system
+          endef
+          define Build/Compile
+            $(MAKE) -C $(PKG_BUILD_DIR) -j1
+          endef
+          define Package/tor/install
+            $(INSTALL_DIR) $(1)/usr/bin
+            $(INSTALL_BIN) $(PKG_BUILD_DIR)/src/or/tor $(1)/usr/bin/tor || true
+          endef
+          include $(INCLUDE_DIR)/package.mk
+          EOF
+          # write Makefile helpers to set variable from env
+          echo "TOR_VER_FROM_ENV=${TOR_VERSION}" > "$SDK/package/tor-local/Makefile.env"
+          # ensure package file is visible
+          sed -i '/^PKG_VERSION:/d' "$SDK/package/tor-local/Makefile" || true
+          # create an empty patch dir to avoid warnings
+          mkdir -p "$SDK/package/tor-local/patches"
+
+      - name: Ensure feeds and install (SDK)
+        run: |
+          cd /tmp/$SDK_DIR
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a || true
+
+      - name: Build tor package
+        run: |
+          set -e
+          cd /tmp/$SDK_DIR
+          export TOR_VER_FROM_ENV="${TOR_VERSION}"
+          # prefer local tor-local package if present; try both paths
+          make package/tor-local/compile -j${{ env.JOBS }} V=s || make package/tor/compile -j${{ env.JOBS }} V=s
+
+      - name: Collect artifacts
+        run: |
+          SDK="/tmp/$SDK_DIR"
+          mkdir -p /tmp/artifacts
+          find "$SDK" -type f -name "tor*.ipk" -exec cp {} /tmp/artifacts/ \; || true
+          # also attempt to find any tor ipk under bin/packages
+          find "$SDK" -path "*/bin/packages/*" -name "tor*.ipk" -exec cp {} /tmp/artifacts/ \; || true
+          ls -l /tmp/artifacts || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tor-openwrt-bcm2711-${{ env.OPENWRT_VERSION }}
+          path: /tmp/artifacts
