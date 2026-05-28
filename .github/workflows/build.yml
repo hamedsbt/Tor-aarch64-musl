@@ -31,14 +31,33 @@ jobs:
           SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
           echo "Index: $SDK_INDEX"
           html=$(curl -fsS "$SDK_INDEX")
-          # find an SDK tarball for aarch64 with musl, Linux-x86_64
-          sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*aarch64[^"]*musl[^"]*Linux-x86_64.tar.xz' | head -n1)
+          
+          # match openwrt-sdk...aarch64...musl...Linux-x86_64.{tar.xz,tar.zst}
+          sdkfile=$(printf "%s" "$html" \
+            | grep -oP 'openwrt-sdk[^"]*aarch64[^"]*musl[^"]*Linux-x86_64\.(tar\.xz|tar\.zst)' \
+            | head -n1)
+          
           if [ -z "$sdkfile" ]; then
             echo "No matching SDK file found at $SDK_INDEX" >&2
             exit 1
           fi
+          
           sdkurl="${SDK_INDEX}${sdkfile}"
           echo "sdkurl=$sdkurl" >> "$GITHUB_OUTPUT"
+          echo "Found: $sdkfile"
+          
+          # download and extract (handles .tar.xz and .tar.zst)
+          curl -fsSL "$sdkurl" -o /tmp/openwrt-sdk.tar
+          case "$sdkfile" in
+            *.tar.xz)  tar -xJf /tmp/openwrt-sdk.tar -C /tmp ;;
+            *.tar.zst) unzstd -q -c /tmp/openwrt-sdk.tar | tar -x -C /tmp ;;
+            *) echo "Unknown archive format" >&2; exit 1 ;;
+          esac
+          
+          # set SDK_DIR
+          SDK_DIR=$(tar -tf /tmp/openwrt-sdk.tar | head -n1 | cut -f1 -d"/")
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
 
       - name: Download & extract SDK
         id: extract_sdk
