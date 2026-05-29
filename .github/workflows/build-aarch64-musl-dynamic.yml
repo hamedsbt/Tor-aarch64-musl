@@ -65,7 +65,7 @@ jobs:
       - name: Configure Tor
         run: |
           cd $TOR_BUILD_DIR
-          
+
           export CC=aarch64-openwrt-linux-musl-gcc
           export CXX=aarch64-openwrt-linux-musl-g++
           export AR=aarch64-openwrt-linux-musl-ar
@@ -75,21 +75,19 @@ jobs:
           export CPPFLAGS="-I$TOOLCHAIN_PATH/include"
           
           ./configure \
-          --host=aarch64-openwrt-linux-musl \
-          --prefix=/usr \
-          --sysconfdir=/etc \
-          --localstatedir=/var \
-          --disable-asciidoc \
-          --disable-system-torrc \
-          --disable-unittests \
-          --disable-static \
-          --enable-shared \
-          --disable-tool-name-check \
-          --with-openssl-dir=$TOOLCHAIN_PATH \
-          --with-libevent-dir=$TOOLCHAIN_PATH \
-          --with-zlib-dir=$TOOLCHAIN_PATH \
-          --with-*-dir
-
+            --host=aarch64-openwrt-linux-musl \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --localstatedir=/var \
+            --disable-asciidoc \
+            --disable-system-torrc \
+            --disable-unittests \
+            --disable-static \
+            --enable-shared \
+            --disable-tool-name-check \
+            --with-openssl-dir=$TOOLCHAIN_PATH \
+            --with-libevent-dir=$TOOLCHAIN_PATH \
+            --with-zlib-dir=$TOOLCHAIN_PATH
           
           echo "Configuration complete"
 
