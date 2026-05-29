@@ -29,24 +29,16 @@ jobs:
         id: find_sdk
         run: |
           SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
-          echo "Index: $SDK_INDEX"
           html=$(curl -fsS "$SDK_INDEX")
-
-          # Match the exact SDK filename for bcm27xx/bcm2711
           sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*bcm27xx-bcm2711[^"]*musl[^"]*Linux-x86_64\.tar\.zst' | head -n1)
           if [ -z "$sdkfile" ]; then
             echo "No matching SDK file found at $SDK_INDEX" >&2
             exit 1
           fi
-
           sdkurl="${SDK_INDEX}${sdkfile}"
-          echo "sdkurl=$sdkurl" >> "$GITHUB_OUTPUT"
           echo "Found SDK: $sdkfile"
-
-          # Download and extract
           curl -fsSL "$sdkurl" -o /tmp/openwrt-sdk.tar.zst
           tar -xf /tmp/openwrt-sdk.tar.zst -C /tmp
-
           SDK_DIR=$(tar -tf /tmp/openwrt-sdk.tar.zst | head -n1 | cut -f1 -d"/")
           echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
           echo "SDK extracted to: /tmp/$SDK_DIR"
@@ -61,7 +53,7 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
 
-      - name: Update feeds (important – makes openssl known)
+      - name: Update and install feeds (critical)
         run: |
           cd /tmp/$SDK_DIR
           ./scripts/feeds update -a
@@ -71,7 +63,6 @@ jobs:
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p "$SDK/package/tor-local"
-
           cat > "$SDK/package/tor-local/Makefile" <<'EOF'
           include $(TOPDIR)/rules.mk
 
@@ -82,7 +73,7 @@ jobs:
           PKG_SOURCE_URL:=https://dist.torproject.org
           PKG_HASH:=skip
 
-          PKG_BUILD_DEPENDS:=openssl
+          PKG_BUILD_DEPENDS:=libopenssl
           PKG_INSTALL:=1
 
           include $(INCLUDE_DIR)/package.mk
@@ -91,7 +82,7 @@ jobs:
             SECTION:=net
             CATEGORY:=Network
             TITLE:=Tor - onion routing daemon
-            DEPENDS:=+openssl +libpthread
+            DEPENDS:=+libopenssl +libpthread
             URL:=https://www.torproject.org
           endef
 
@@ -122,44 +113,44 @@ jobs:
           $(eval $(call BuildPackage,tor))
           EOF
 
-          echo "Makefile created at $SDK/package/tor-local"
-
-      - name: Configure SDK (enable tor and openssl)
+      - name: Configure SDK (enable tor and libopenssl) with verbose output
         run: |
           cd /tmp/$SDK_DIR
           # Generate a baseline .config
           make defconfig
-          # Enable our package and its dependencies
+          # Manually enable required packages
           sed -i 's/# CONFIG_PACKAGE_tor-local is not set/CONFIG_PACKAGE_tor-local=y/' .config
-          sed -i 's/# CONFIG_PACKAGE_openssl is not set/CONFIG_PACKAGE_openssl=y/' .config
-          # Ensure they are present even if the lines didn't exist
+          sed -i 's/# CONFIG_PACKAGE_libopenssl is not set/CONFIG_PACKAGE_libopenssl=y/' .config
+          # Ensure they are present
           grep -q "CONFIG_PACKAGE_tor-local=y" .config || echo "CONFIG_PACKAGE_tor-local=y" >> .config
-          grep -q "CONFIG_PACKAGE_openssl=y" .config || echo "CONFIG_PACKAGE_openssl=y" >> .config
-          # Automatically resolve any new symbols
-          make olddefconfig
-          # Verify (optional, for debugging)
-          echo "=== Final .config entries for tor and openssl ==="
-          grep -E "CONFIG_PACKAGE_(tor|openssl)" .config || true
+          grep -q "CONFIG_PACKAGE_libopenssl=y" .config || echo "CONFIG_PACKAGE_libopenssl=y" >> .config
+          # Run olddefconfig with verbose output to see what fails
+          make olddefconfig V=s
+          # Save final .config for debugging
+          cp .config /tmp/final.config
+
+      - name: Upload .config for debugging (if step fails)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-config
+          path: /tmp/final.config
 
       - name: Build tor package
         run: |
           cd /tmp/$SDK_DIR
           make package/tor-local/compile V=s
 
-      - name: Collect artifacts (.ipk packages)
+      - name: Collect artifacts
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p /tmp/artifacts
           find "$SDK" -type f -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
           find "$SDK" -path "*/bin/packages/*" -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
           ls -la /tmp/artifacts/ || echo "No ipk files found"
-          # If still no artifacts, grab the raw binary as fallback
           if [ ! "$(ls -A /tmp/artifacts/ 2>/dev/null)" ]; then
             tor_bin=$(find "$SDK" -type f -name "tor" -path "*/src/app/tor" 2>/dev/null | head -1)
-            if [ -n "$tor_bin" ]; then
-              cp "$tor_bin" /tmp/artifacts/
-              echo "Copied fallback binary: $tor_bin"
-            fi
+            [ -n "$tor_bin" ] && cp "$tor_bin" /tmp/artifacts/
           fi
 
       - name: Upload artifacts
