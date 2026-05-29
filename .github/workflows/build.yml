@@ -12,7 +12,7 @@ env:
   OPENWRT_VERSION: 25.12.4
   TARGET_DIR: bcm27xx/bcm2711
   JOBS: 2
-  TOR_VERSION: 0.4.8.12   # pin to a known version
+  TOR_VERSION: 0.4.8.12
 
 jobs:
   build:
@@ -32,24 +32,17 @@ jobs:
         id: find_sdk
         run: |
           SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
-          echo "Index: $SDK_INDEX"
           html=$(curl -fsS "$SDK_INDEX")
-          
-          # match actual SDK filename pattern for bcm27xx-bcm2711
           sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*bcm27xx-bcm2711[^"]*musl[^"]*Linux-x86_64\.tar\.zst' | head -n1)
-          
           if [ -z "$sdkfile" ]; then
             echo "No matching SDK file found at $SDK_INDEX" >&2
             exit 1
           fi
-          
           sdkurl="${SDK_INDEX}${sdkfile}"
           echo "sdkurl=$sdkurl" >> "$GITHUB_OUTPUT"
           echo "Found: $sdkfile"
-          
           curl -fsSL "$sdkurl" -o /tmp/openwrt-sdk.tar.zst
           tar -xf /tmp/openwrt-sdk.tar.zst -C /tmp
-          
           SDK_DIR=$(tar -tf /tmp/openwrt-sdk.tar.zst | head -n1 | cut -f1 -d"/")
           echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
           echo "SDK extracted to: /tmp/$SDK_DIR"
@@ -64,39 +57,21 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
 
-      - name: Configure SDK (enable tor and its dependencies)
-        run: |
-          cd /tmp/$SDK_DIR
-          # Start from a clean default config
-          make defconfig
-          # Enable tor and libopenssl
-          ./scripts/config --enable CONFIG_PACKAGE_tor-local
-          ./scripts/config --enable CONFIG_PACKAGE_libopenssl
-          # Optional: enable IPv6 if needed
-          ./scripts/config --enable CONFIG_IPV6
-          # Finalize config
-          make defconfig
-
       - name: Create tor package Makefile
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p "$SDK/package/tor-local"
-          
           cat > "$SDK/package/tor-local/Makefile" <<'EOF'
           include $(TOPDIR)/rules.mk
-          
           PKG_NAME:=tor
           PKG_VERSION:=0.4.8.12
           PKG_RELEASE:=1
           PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
           PKG_SOURCE_URL:=https://dist.torproject.org
           PKG_HASH:=skip
-          
           PKG_BUILD_DEPENDS:=libopenssl
           PKG_INSTALL:=1
-          
           include $(INCLUDE_DIR)/package.mk
-          
           define Package/tor
             SECTION:=net
             CATEGORY:=Network
@@ -104,12 +79,9 @@ jobs:
             DEPENDS:=+libopenssl +libpthread
             URL:=https://www.torproject.org
           endef
-          
           define Package/tor/description
-            Tor is a toolset for a wide range of organizations and people that want
-            to improve their safety and security on the Internet.
+            Tor is a toolset for online privacy and anonymity.
           endef
-          
           define Build/Configure
             (cd $(PKG_BUILD_DIR); \
               ./configure \
@@ -122,20 +94,36 @@ jobs:
                 --with-openssl-dir=$(STAGING_DIR)/usr \
             )
           endef
-          
           define Package/tor/install
             $(INSTALL_DIR) $(1)/usr/bin
             $(INSTALL_BIN) $(PKG_BUILD_DIR)/src/app/tor $(1)/usr/bin/
             $(INSTALL_DIR) $(1)/etc/tor
             $(INSTALL_DATA) $(PKG_BUILD_DIR)/src/config/torrc.sample $(1)/etc/tor/torrc.sample
           endef
-          
           $(eval $(call BuildPackage,tor))
           EOF
-          
-          echo "Package Makefile created"
+          echo "Package Makefile created at $SDK/package/tor-local"
 
-      - name: Update feeds
+      - name: Configure SDK to enable tor and libopenssl
+        run: |
+          cd /tmp/$SDK_DIR
+          # Initial defconfig to get a base .config
+          make defconfig
+          # Enable our package and its dependencies by editing .config directly
+          sed -i 's/# CONFIG_PACKAGE_tor-local is not set/CONFIG_PACKAGE_tor-local=y/' .config
+          sed -i 's/# CONFIG_PACKAGE_libopenssl is not set/CONFIG_PACKAGE_libopenssl=y/' .config
+          sed -i 's/# CONFIG_IPV6 is not set/CONFIG_IPV6=y/' .config
+          # In case the lines don't exist, append them
+          grep -q "CONFIG_PACKAGE_tor-local=y" .config || echo "CONFIG_PACKAGE_tor-local=y" >> .config
+          grep -q "CONFIG_PACKAGE_libopenssl=y" .config || echo "CONFIG_PACKAGE_libopenssl=y" >> .config
+          grep -q "CONFIG_IPV6=y" .config || echo "CONFIG_IPV6=y" >> .config
+          # Resolve any new dependencies silently
+          make olddefconfig
+          # Verify that our options are now set
+          grep "CONFIG_PACKAGE_tor-local" .config || true
+          grep "CONFIG_PACKAGE_libopenssl" .config || true
+
+      - name: Update feeds (optional, for completeness)
         run: |
           cd /tmp/$SDK_DIR
           ./scripts/feeds update -a
@@ -150,24 +138,13 @@ jobs:
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p /tmp/artifacts
-          
           find "$SDK" -type f -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
           find "$SDK" -path "*/bin/packages/*" -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
-          
-          if [ -d "$SDK/bin" ]; then
-            find "$SDK/bin" -type f -name "*.ipk" -exec cp -v {} /tmp/artifacts/ \;
-          fi
-          
-          echo "Artifacts collected:"
-          ls -la /tmp/artifacts/ || echo "No artifacts found"
-          
-          # Fallback: copy binary if no ipk
+          ls -la /tmp/artifacts/ || echo "No ipk files found"
+          # Fallback: copy binary if ipk missing
           if [ ! "$(ls -A /tmp/artifacts/ 2>/dev/null)" ]; then
             tor_binary=$(find "$SDK" -type f -name "tor" -path "*/src/app/tor" 2>/dev/null | head -1)
-            if [ -n "$tor_binary" ]; then
-              cp "$tor_binary" /tmp/artifacts/
-              echo "Binary copied as fallback"
-            fi
+            [ -n "$tor_binary" ] && cp "$tor_binary" /tmp/artifacts/
           fi
 
       - name: Upload artifacts
