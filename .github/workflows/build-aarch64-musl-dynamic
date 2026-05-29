@@ -1,4 +1,4 @@
-name: Build Tor Binary for OpenWrt v25
+name: Build Tor Binary for OpenWrt (aarch64-musl)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl build-essential zstd file pkg-config autoconf automake libtool
+          sudo apt-get install -y curl build-essential zstd file
 
       - name: Extract OpenWrt SDK toolchain
         run: |
@@ -32,55 +32,48 @@ jobs:
           
           # Add toolchain to PATH
           echo "/tmp/$SDK_DIR/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl/bin" >> $GITHUB_PATH
-          
-          # Verify toolchain
-          echo "Toolchain verification:"
-          aarch64-openwrt-linux-musl-gcc --version | head -1
 
-      - name: Build Tor with system OpenSSL linkage
+      - name: Build Tor (dynamically linked, aarch64-musl)
         run: |
           cd /tmp
           curl -fsSL "https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz" -o tor.tar.gz
           tar -xzf tor.tar.gz
           cd tor-${TOR_VERSION}
           
-          # Set cross-compilation environment
-          export CC=aarch64-openwrt-linux-musl-gcc
-          export CXX=aarch64-openwrt-linux-musl-g++
-          export AR=aarch64-openwrt-linux-musl-ar
-          export RANLIB=aarch64-openwrt-linux-musl-ranlib
-          export PKG_CONFIG_PATH=/tmp/$SDK_DIR/staging_dir/target-aarch64_cortex-a72_musl/usr/lib/pkgconfig
-          
-          # Configure for cross-compilation (links against target's OpenSSL)
+          # Cross-compile for aarch64-musl
           ./configure \
             --host=aarch64-openwrt-linux-musl \
-            --prefix=/usr \
-            --sysconfdir=/etc \
-            --localstatedir=/var \
             --disable-asciidoc \
             --disable-system-torrc \
-            --disable-unittests \
-            --with-libevent-dir=/tmp/$SDK_DIR/staging_dir/target-aarch64_cortex-a72_musl/usr \
-            --with-openssl-dir=/tmp/$SDK_DIR/staging_dir/target-aarch64_cortex-a72_musl/usr
+            --disable-unittests
           
-          # Build
           make -j${JOBS}
-          
-          # Strip debug symbols
           aarch64-openwrt-linux-musl-strip src/app/tor
           
-          # Show binary info
-          echo "Built Tor binary:"
-          file src/app/tor
-          echo "Size: $(ls -lh src/app/tor | awk '{print $5}')"
+          # Create properly named binary
+          BINARY_NAME="tor-${TOR_VERSION}-aarch64-musl-dynamic"
+          cp src/app/tor "/tmp/${BINARY_NAME}"
           
-          # Create artifact
+          # Show binary information
+          echo "=========================================="
+          echo "Binary built successfully:"
+          echo "=========================================="
+          file "/tmp/${BINARY_NAME}"
+          echo ""
+          echo "Dynamic library dependencies:"
+          aarch64-openwrt-linux-musl-readelf -d "/tmp/${BINARY_NAME}" | grep NEEDED || \
+          aarch64-openwrt-linux-musl-objdump -p "/tmp/${BINARY_NAME}" | grep NEEDED
+          echo ""
+          echo "Binary size: $(ls -lh /tmp/${BINARY_NAME} | awk '{print $5}')"
+          echo "=========================================="
+          
           mkdir -p /tmp/artifacts
-          cp src/app/tor /tmp/artifacts/
-          cp src/config/torrc.sample /tmp/artifacts/ 2>/dev/null || echo "No sample config"
+          cp "/tmp/${BINARY_NAME}" /tmp/artifacts/
+          cp src/config/torrc.sample /tmp/artifacts/torrc.sample 2>/dev/null || true
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: tor-${TOR_VERSION}-bcm2711-openssl
-          path: /tmp/artifacts/tor
+          name: tor-${TOR_VERSION}-aarch64-musl-dynamic
+          path: /tmp/artifacts/
+          if-no-files-found: warn
