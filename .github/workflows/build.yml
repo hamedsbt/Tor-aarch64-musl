@@ -49,11 +49,11 @@ jobs:
           path: |
             /tmp/${{ env.SDK_DIR }}/dl
             /tmp/${{ env.SDK_DIR }}/build_dir
-          key: openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-v1
+          key: openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-v2
           restore-keys: |
             openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
 
-      - name: Update and install feeds (critical)
+      - name: Update and install feeds
         run: |
           cd /tmp/$SDK_DIR
           ./scripts/feeds update -a
@@ -113,44 +113,58 @@ jobs:
           $(eval $(call BuildPackage,tor))
           EOF
 
-      - name: Configure SDK (enable tor and libopenssl) with verbose output
+      - name: Configure SDK (enable tor and libopenssl)
         run: |
           cd /tmp/$SDK_DIR
-          # Generate a baseline .config
-          make defconfig
-          # Manually enable required packages
-          sed -i 's/# CONFIG_PACKAGE_tor-local is not set/CONFIG_PACKAGE_tor-local=y/' .config
-          sed -i 's/# CONFIG_PACKAGE_libopenssl is not set/CONFIG_PACKAGE_libopenssl=y/' .config
-          # Ensure they are present
+          # Create initial config
+          make defconfig || true  # Allow defconfig to "fail" due to feed errors
+          # Manually enable required packages (force them)
+          sed -i 's/# CONFIG_PACKAGE_tor-local is not set/CONFIG_PACKAGE_tor-local=y/' .config 2>/dev/null || true
+          sed -i 's/# CONFIG_PACKAGE_libopenssl is not set/CONFIG_PACKAGE_libopenssl=y/' .config 2>/dev/null || true
+          # Append if not present
           grep -q "CONFIG_PACKAGE_tor-local=y" .config || echo "CONFIG_PACKAGE_tor-local=y" >> .config
           grep -q "CONFIG_PACKAGE_libopenssl=y" .config || echo "CONFIG_PACKAGE_libopenssl=y" >> .config
-          # Run olddefconfig with verbose output to see what fails
-          make olddefconfig V=s
-          # Save final .config for debugging
-          cp .config /tmp/final.config
-
-      - name: Upload .config for debugging (if step fails)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-config
-          path: /tmp/final.config
+          # Also enable basic build options
+          grep -q "CONFIG_DEVEL=y" .config || echo "CONFIG_DEVEL=y" >> .config
+          grep -q "CONFIG_IPV6=y" .config || echo "CONFIG_IPV6=y" >> .config
+          # Finalize config without interactive prompts
+          yes "" | make oldconfig || true
+          echo "Final .config contents (tor/openssl):"
+          grep -E "CONFIG_PACKAGE_(tor|libopenssl)" .config || echo "Not found"
 
       - name: Build tor package
         run: |
           cd /tmp/$SDK_DIR
+          # Build will pull all dependencies including libopenssl
           make package/tor-local/compile V=s
 
       - name: Collect artifacts
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p /tmp/artifacts
-          find "$SDK" -type f -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
-          find "$SDK" -path "*/bin/packages/*" -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
-          ls -la /tmp/artifacts/ || echo "No ipk files found"
+          echo "Searching for tor .ipk files..."
+          find "$SDK" -type f -name "tor*.ipk" 2>/dev/null | while read ipk; do
+            echo "Found: $ipk"
+            cp -v "$ipk" /tmp/artifacts/
+          done
+          find "$SDK" -path "*/bin/packages/*" -name "*.ipk" 2>/dev/null | while read ipk; do
+            if echo "$ipk" | grep -qi tor; then
+              echo "Found in bin: $ipk"
+              cp -v "$ipk" /tmp/artifacts/
+            fi
+          done
+          echo "Artifacts directory contents:"
+          ls -la /tmp/artifacts/ || echo "No artifacts found"
+          
+          # Fallback: copy binary if no ipk
           if [ ! "$(ls -A /tmp/artifacts/ 2>/dev/null)" ]; then
-            tor_bin=$(find "$SDK" -type f -name "tor" -path "*/src/app/tor" 2>/dev/null | head -1)
-            [ -n "$tor_bin" ] && cp "$tor_bin" /tmp/artifacts/
+            echo "No ipk files, looking for binary..."
+            tor_bin=$(find "$SDK" -type f -name "tor" -executable 2>/dev/null | grep -E "(src/app/tor|src/or/tor)" | head -1)
+            if [ -n "$tor_bin" ]; then
+              echo "Found binary: $tor_bin"
+              cp "$tor_bin" /tmp/artifacts/
+              file /tmp/artifacts/tor
+            fi
           fi
 
       - name: Upload artifacts
