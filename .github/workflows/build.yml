@@ -2,13 +2,17 @@ name: Build Tor for OpenWrt 25.12.4 (bcm2711 aarch64-musl) - self-contained
 
 on:
   workflow_dispatch:
-  push:
+  schedule:
+    - cron: "0 3 1 * *"   # 03:00 UTC on the 1st of each month
+
+permissions:
+  contents: write
 
 env:
   OPENWRT_VERSION: 25.12.4
   TARGET_DIR: bcm27xx/bcm2711
   JOBS: 2
-  TOR_VERSION: latest   # set to a specific version like "0.4.8.11" to pin
+  TOR_VERSION: 0.4.8.12   # pin to a known version
 
 jobs:
   build:
@@ -31,7 +35,7 @@ jobs:
           echo "Index: $SDK_INDEX"
           html=$(curl -fsS "$SDK_INDEX")
           
-          # match the actual SDK filename pattern for bcm27xx-bcm2711
+          # match actual SDK filename pattern for bcm27xx-bcm2711
           sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*bcm27xx-bcm2711[^"]*musl[^"]*Linux-x86_64\.tar\.zst' | head -n1)
           
           if [ -z "$sdkfile" ]; then
@@ -43,16 +47,12 @@ jobs:
           echo "sdkurl=$sdkurl" >> "$GITHUB_OUTPUT"
           echo "Found: $sdkfile"
           
-          # download and extract
-          echo "Downloading $sdkurl"
           curl -fsSL "$sdkurl" -o /tmp/openwrt-sdk.tar.zst
           tar -xf /tmp/openwrt-sdk.tar.zst -C /tmp
           
-          # set SDK_DIR
           SDK_DIR=$(tar -tf /tmp/openwrt-sdk.tar.zst | head -n1 | cut -f1 -d"/")
           echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
           echo "SDK extracted to: /tmp/$SDK_DIR"
-          ls -la "/tmp/$SDK_DIR"
 
       - name: Cache downloads and build_dir
         uses: actions/cache@v4
@@ -64,27 +64,20 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ env.OPENWRT_VERSION }}-bcm2711-${{ runner.os }}-
 
-      - name: Create minimal .config for SDK
+      - name: Configure SDK (enable tor and its dependencies)
         run: |
           cd /tmp/$SDK_DIR
-          # Create a minimal .config file to avoid interactive menuconfig
-          cat > .config <<'EOF'
-          CONFIG_TARGET_bcm27xx=y
-          CONFIG_TARGET_bcm27xx_bcm2711=y
-          CONFIG_TARGET_MULTI_PROFILE=y
-          CONFIG_TARGET_ALL_PROFILES=y
-          CONFIG_DEVEL=y
-          CONFIG_KERNEL_KALLSYMS=y
-          CONFIG_KERNEL_PROFILING=y
-          CONFIG_KERNEL_ELF_CORE=y
-          CONFIG_IPV6=y
-          CONFIG_PACKAGE_tor-local=y
-          EOF
-          
-          # Run defconfig to resolve dependencies
+          # Start from a clean default config
+          make defconfig
+          # Enable tor and libopenssl
+          ./scripts/config --enable CONFIG_PACKAGE_tor-local
+          ./scripts/config --enable CONFIG_PACKAGE_libopenssl
+          # Optional: enable IPv6 if needed
+          ./scripts/config --enable CONFIG_IPV6
+          # Finalize config
           make defconfig
 
-      - name: Create local tor package
+      - name: Create tor package Makefile
         run: |
           SDK="/tmp/$SDK_DIR"
           mkdir -p "$SDK/package/tor-local"
@@ -140,10 +133,9 @@ jobs:
           $(eval $(call BuildPackage,tor))
           EOF
           
-          echo "Package directory created at $SDK/package/tor-local"
-          ls -la "$SDK/package/tor-local"
+          echo "Package Makefile created"
 
-      - name: Update feeds and install
+      - name: Update feeds
         run: |
           cd /tmp/$SDK_DIR
           ./scripts/feeds update -a
@@ -151,15 +143,7 @@ jobs:
 
       - name: Build tor package
         run: |
-          set -e
           cd /tmp/$SDK_DIR
-          export TOR_VER_FROM_ENV="${TOR_VERSION}"
-          export JOBS="${JOBS}"
-          # Make sure dependencies are built first
-          make package/tor-local/clean V=s || true
-          make tools/install V=s
-          make toolchain/install V=s
-          make target/compile V=s
           make package/tor-local/compile V=s
 
       - name: Collect artifacts
@@ -167,27 +151,22 @@ jobs:
           SDK="/tmp/$SDK_DIR"
           mkdir -p /tmp/artifacts
           
-          # Find and copy all tor-related ipk files
-          echo "Searching for tor*.ipk files..."
           find "$SDK" -type f -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
+          find "$SDK" -path "*/bin/packages/*" -name "tor*.ipk" -exec cp -v {} /tmp/artifacts/ \;
           
-          # Also check bin directory specifically
           if [ -d "$SDK/bin" ]; then
             find "$SDK/bin" -type f -name "*.ipk" -exec cp -v {} /tmp/artifacts/ \;
           fi
           
-          # List artifacts
           echo "Artifacts collected:"
           ls -la /tmp/artifacts/ || echo "No artifacts found"
           
-          # If no ipk files found, try to find the compiled binary
+          # Fallback: copy binary if no ipk
           if [ ! "$(ls -A /tmp/artifacts/ 2>/dev/null)" ]; then
-            echo "No ipk files found, looking for tor binary..."
             tor_binary=$(find "$SDK" -type f -name "tor" -path "*/src/app/tor" 2>/dev/null | head -1)
             if [ -n "$tor_binary" ]; then
-              echo "Found tor binary: $tor_binary"
               cp "$tor_binary" /tmp/artifacts/
-              file /tmp/artifacts/tor
+              echo "Binary copied as fallback"
             fi
           fi
 
