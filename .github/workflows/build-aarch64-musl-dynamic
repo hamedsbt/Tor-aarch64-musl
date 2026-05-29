@@ -1,4 +1,4 @@
-name: Build Tor Binary for OpenWrt (aarch64-musl)
+name: Build Tor Binary for OpenWrt (aarch64-musl, dynamic)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ env:
   OPENWRT_VERSION: 25.12.4
   TARGET_DIR: bcm27xx/bcm2711
   JOBS: 2
-  TOR_VERSION: 0.4.8.12
 
 jobs:
   build:
@@ -17,63 +16,118 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl build-essential zstd file
+          sudo apt-get install -y curl build-essential zstd file pkg-config
 
       - name: Extract OpenWrt SDK toolchain
         run: |
           SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
           html=$(curl -fsS "$SDK_INDEX")
           sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*bcm27xx-bcm2711[^"]*musl[^"]*Linux-x86_64\.tar\.zst' | head -1)
+          
+          if [ -z "$sdkfile" ]; then
+            echo "Error: Could not find SDK"
+            exit 1
+          fi
+          
           echo "Found SDK: $sdkfile"
           curl -fsSL "${SDK_INDEX}${sdkfile}" -o /tmp/sdk.tar.zst
           tar -xf /tmp/sdk.tar.zst -C /tmp
+          
           SDK_DIR=$(tar -tf /tmp/sdk.tar.zst | head -1 | cut -f1 -d"/")
           echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
           
-          # Add toolchain to PATH
-          echo "/tmp/$SDK_DIR/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl/bin" >> $GITHUB_PATH
+          TOOLCHAIN_PATH="/tmp/$SDK_DIR/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl"
+          echo "TOOLCHAIN_PATH=$TOOLCHAIN_PATH" >> $GITHUB_ENV
+          echo "$TOOLCHAIN_PATH/bin" >> $GITHUB_PATH
 
-      - name: Build Tor (dynamically linked, aarch64-musl)
+      - name: Get latest Tor version
+        id: tor_version
         run: |
-          cd /tmp
-          curl -fsSL "https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz" -o tor.tar.gz
-          tar -xzf tor.tar.gz
-          cd tor-${TOR_VERSION}
+          URL="https://dist.torproject.org/?C=M;O=D"
+          LATEST_FILE=$(curl -s "$URL" | grep -o 'tor-[^"]*\.tar\.gz' | head -1)
           
-          # Cross-compile for aarch64-musl
+          if [ -z "$LATEST_FILE" ]; then
+            echo "Error: Could not find tor-*.tar.gz file"
+            exit 1
+          fi
+          
+          VERSION=$(echo "$LATEST_FILE" | sed 's/^tor-//; s/\.tar\.gz$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest Tor version: $VERSION"
+
+      - name: Download and extract Tor source
+        run: |
+          TOR_VERSION="${{ steps.tor_version.outputs.version }}"
+          curl -fsSL "https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz" -o /tmp/tor.tar.gz
+          tar -xzf /tmp/tor.tar.gz -C /tmp
+          echo "TOR_BUILD_DIR=/tmp/tor-${TOR_VERSION}" >> $GITHUB_ENV
+
+      - name: Configure Tor
+        run: |
+          cd $TOR_BUILD_DIR
+          
+          export CC=aarch64-openwrt-linux-musl-gcc
+          export CXX=aarch64-openwrt-linux-musl-g++
+          export AR=aarch64-openwrt-linux-musl-ar
+          export RANLIB=aarch64-openwrt-linux-musl-ranlib
+          export CFLAGS="-O2 -D_GNU_SOURCE"
+          export LDFLAGS="-L$TOOLCHAIN_PATH/lib"
+          export CPPFLAGS="-I$TOOLCHAIN_PATH/include"
+          
           ./configure \
             --host=aarch64-openwrt-linux-musl \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --localstatedir=/var \
             --disable-asciidoc \
             --disable-system-torrc \
-            --disable-unittests
+            --disable-unittests \
+            --disable-static \
+            --enable-shared \
+            --with-openssl-dir=$TOOLCHAIN_PATH \
+            --with-libevent-dir=$TOOLCHAIN_PATH \
+            --with-zlib-dir=$TOOLCHAIN_PATH
           
-          make -j${JOBS}
-          aarch64-openwrt-linux-musl-strip src/app/tor
-          
-          # Create properly named binary
-          BINARY_NAME="tor-${TOR_VERSION}-aarch64-musl-dynamic"
-          cp src/app/tor "/tmp/${BINARY_NAME}"
-          
-          # Show binary information
-          echo "=========================================="
-          echo "Binary built successfully:"
-          echo "=========================================="
-          file "/tmp/${BINARY_NAME}"
-          echo ""
-          echo "Dynamic library dependencies:"
-          aarch64-openwrt-linux-musl-readelf -d "/tmp/${BINARY_NAME}" | grep NEEDED || \
-          aarch64-openwrt-linux-musl-objdump -p "/tmp/${BINARY_NAME}" | grep NEEDED
-          echo ""
-          echo "Binary size: $(ls -lh /tmp/${BINARY_NAME} | awk '{print $5}')"
-          echo "=========================================="
-          
-          mkdir -p /tmp/artifacts
-          cp "/tmp/${BINARY_NAME}" /tmp/artifacts/
-          cp src/config/torrc.sample /tmp/artifacts/torrc.sample 2>/dev/null || true
+          echo "Configuration complete"
 
-      - name: Upload binary
+      - name: Build Tor
+        run: |
+          cd $TOR_BUILD_DIR
+          make -j${JOBS}
+          echo "Build complete"
+
+      - name: Strip and package binary
+        run: |
+          TOR_VERSION="${{ steps.tor_version.outputs.version }}"
+          SOURCE_BINARY="$TOR_BUILD_DIR/src/app/tor"
+          
+          if [ ! -f "$SOURCE_BINARY" ]; then
+            echo "Error: Binary not found at $SOURCE_BINARY"
+            exit 1
+          fi
+          
+          # Verify it's dynamic and correctly linked
+          echo "=== Binary Info ==="
+          file "$SOURCE_BINARY"
+          ldd "$SOURCE_BINARY" || echo "ldd check skipped (cross-compiled)"
+          
+          # Strip the binary
+          aarch64-openwrt-linux-musl-strip "$SOURCE_BINARY"
+          
+          # Create artifact directory
+          mkdir -p /tmp/artifacts
+          
+          # Copy with meaningful name: tor-{version}-openwrt-aarch64-musl-dynamic
+          BINARY_NAME="tor-${TOR_VERSION}-openwrt-aarch64-musl-dynamic"
+          cp "$SOURCE_BINARY" "/tmp/artifacts/${BINARY_NAME}"
+          
+          echo "Binary created: ${BINARY_NAME}"
+          ls -lh "/tmp/artifacts/${BINARY_NAME}"
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tor-${TOR_VERSION}-aarch64-musl-dynamic
+          name: tor-openwrt-aarch64-musl-dynamic
           path: /tmp/artifacts/
-          if-no-files-found: warn
+          retention-days: 30
+          if-no-files-found: error
