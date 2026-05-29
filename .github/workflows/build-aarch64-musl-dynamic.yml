@@ -1,0 +1,244 @@
+name: Build Tor Binary for OpenWrt (aarch64-musl, dynamic)
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  OPENWRT_VERSION: 25.12.4
+  TARGET_DIR: bcm27xx/bcm2711
+  JOBS: 2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl build-essential zstd file pkg-config
+
+      - name: Extract and prepare toolchain only
+        run: |
+          echo "=== Downloading SDK ==="
+          SDK_INDEX="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET_DIR}/"
+          html=$(curl -fsS "$SDK_INDEX")
+          sdkfile=$(printf "%s" "$html" | grep -oP 'openwrt-sdk[^"]*bcm27xx-bcm2711[^"]*musl[^"]*Linux-x86_64\.tar\.zst' | head -1)
+          
+          if [ -z "$sdkfile" ]; then
+            echo "Error: Could not find SDK"
+            exit 1
+          fi
+          
+          echo "Found SDK: $sdkfile"
+          
+          # Create a temporary extraction point
+          TEMP_EXTRACT="/tmp/sdk-extract-$$"
+          mkdir -p "$TEMP_EXTRACT"
+          
+          # Download SDK
+          curl -fsSL "${SDK_INDEX}${sdkfile}" -o /tmp/sdk.tar.zst
+          
+          # Extract to temp location
+          echo "Extracting SDK to temporary location..."
+          tar -xf /tmp/sdk.tar.zst -C "$TEMP_EXTRACT"
+          
+          # Find the SDK directory name
+          SDK_DIR=$(ls -d "$TEMP_EXTRACT"/openwrt-sdk-* 2>/dev/null | head -1)
+          
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "Error: SDK directory not found"
+            exit 1
+          fi
+          
+          echo "SDK extracted to: $SDK_DIR"
+          
+          # Copy ONLY the toolchain to a clean location
+          TOOLCHAIN_ROOT="/tmp/toolchain-aarch64-musl"
+          mkdir -p "$TOOLCHAIN_ROOT"
+          
+          TOOLCHAIN_SRC="$SDK_DIR/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl"
+          
+          if [ ! -d "$TOOLCHAIN_SRC" ]; then
+            echo "Error: Toolchain not found at $TOOLCHAIN_SRC"
+            ls -la "$SDK_DIR/staging_dir/" || true
+            exit 1
+          fi
+          
+          echo "Copying toolchain to clean location..."
+          cp -r "$TOOLCHAIN_SRC"/* "$TOOLCHAIN_ROOT/"
+          
+          # Also get the target root for headers/libs if needed
+          TARGET_ROOT="$SDK_DIR/staging_dir/target-aarch64_cortex-a72_musl"
+          if [ -d "$TARGET_ROOT" ]; then
+            mkdir -p "$TOOLCHAIN_ROOT/target-libs"
+            cp -r "$TARGET_ROOT"/usr/include "$TOOLCHAIN_ROOT/target-libs/" 2>/dev/null || true
+            cp -r "$TARGET_ROOT"/lib "$TOOLCHAIN_ROOT/target-libs/" 2>/dev/null || true
+            cp -r "$TARGET_ROOT"/usr/lib "$TOOLCHAIN_ROOT/target-libs/" 2>/dev/null || true
+          fi
+          
+          # Clean up the SDK directory to prevent build system triggers
+          rm -rf "$TEMP_EXTRACT"
+          rm -f /tmp/sdk.tar.zst
+          
+          echo "TOOLCHAIN_ROOT=$TOOLCHAIN_ROOT" >> $GITHUB_ENV
+          
+          # Verify toolchain
+          if [ ! -f "$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-gcc" ]; then
+            echo "Error: gcc not found in toolchain"
+            exit 1
+          fi
+          
+          echo "=== Toolchain ready ==="
+          ls -la "$TOOLCHAIN_ROOT/bin/" | grep gcc
+
+      - name: Get latest Tor version
+        id: tor_version
+        run: |
+          URL="https://dist.torproject.org/?C=M;O=D"
+          LATEST_FILE=$(curl -s "$URL" | grep -o 'tor-[^"]*\.tar\.gz' | head -1)
+          
+          if [ -z "$LATEST_FILE" ]; then
+            echo "Error: Could not find tor-*.tar.gz file"
+            exit 1
+          fi
+          
+          VERSION=$(echo "$LATEST_FILE" | sed 's/^tor-//; s/\.tar\.gz$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest Tor version: $VERSION"
+
+      - name: Download and extract Tor source
+        run: |
+          TOR_VERSION="${{ steps.tor_version.outputs.version }}"
+          BUILD_DIR="/tmp/tor-build-$$"
+          mkdir -p "$BUILD_DIR"
+          
+          echo "Downloading Tor $TOR_VERSION..."
+          curl -fsSL "https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz" -o "$BUILD_DIR/tor.tar.gz"
+          
+          tar -xzf "$BUILD_DIR/tor.tar.gz" -C "$BUILD_DIR"
+          
+          TOR_SRC="$BUILD_DIR/tor-${TOR_VERSION}"
+          
+          if [ ! -f "$TOR_SRC/configure" ]; then
+            echo "Error: Tor source not extracted properly"
+            exit 1
+          fi
+          
+          echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+          echo "TOR_VERSION=$TOR_VERSION" >> $GITHUB_ENV
+          echo "TOR_SRC=$TOR_SRC" >> $GITHUB_ENV
+
+      - name: Configure Tor
+        run: |
+          cd "$TOR_SRC"
+          
+          export CC=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-gcc
+          export CXX=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-g++
+          export AR=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-ar
+          export RANLIB=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-ranlib
+          export STRIP=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-strip
+          
+          export CFLAGS="-O2 -pipe -fPIC"
+          export CXXFLAGS="-O2 -pipe -fPIC"
+          export LDFLAGS="-L${TOOLCHAIN_ROOT}/lib"
+          export CPPFLAGS="-I${TOOLCHAIN_ROOT}/include"
+          
+          echo "=== Configure Tor $TOR_VERSION ==="
+          
+          ./configure \
+            --host=aarch64-openwrt-linux-musl \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --localstatedir=/var \
+            --disable-asciidoc \
+            --disable-system-torrc \
+            --disable-unittests \
+            --disable-maintainer-mode \
+            --with-openssl-dir=${TOOLCHAIN_ROOT} \
+            --with-libevent-dir=${TOOLCHAIN_ROOT} \
+            --with-zlib-dir=${TOOLCHAIN_ROOT} \
+            2>&1 | tee configure.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Configure failed!"
+            tail -100 configure.log
+            exit 1
+          fi
+          
+          echo "=== Configure successful ==="
+
+      - name: Build Tor
+        run: |
+          cd "$TOR_SRC"
+          
+          export CC=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-gcc
+          export CXX=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-g++
+          export AR=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-ar
+          export RANLIB=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-ranlib
+          export STRIP=$TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-strip
+          
+          export CFLAGS="-O2 -pipe -fPIC"
+          export CXXFLAGS="-O2 -pipe -fPIC"
+          export LDFLAGS="-L${TOOLCHAIN_ROOT}/lib"
+          export CPPFLAGS="-I${TOOLCHAIN_ROOT}/include"
+          
+          echo "=== Building Tor $TOR_VERSION ==="
+          make -j${JOBS} V=s 2>&1 | tee build.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Build failed!"
+            tail -150 build.log
+            exit 1
+          fi
+          
+          echo "=== Build successful ==="
+
+      - name: Verify and strip binary
+        run: |
+          SOURCE_BINARY="$TOR_SRC/src/app/tor"
+          
+          if [ ! -f "$SOURCE_BINARY" ]; then
+            echo "Error: Binary not found"
+            find "$TOR_SRC" -name "tor" -type f
+            exit 1
+          fi
+          
+          echo "=== Binary Info (Before Strip) ==="
+          file "$SOURCE_BINARY"
+          ls -lh "$SOURCE_BINARY"
+          
+          # Strip
+          $TOOLCHAIN_ROOT/bin/aarch64-openwrt-linux-musl-strip "$SOURCE_BINARY"
+          
+          echo "=== Binary Info (After Strip) ==="
+          file "$SOURCE_BINARY"
+          ls -lh "$SOURCE_BINARY"
+
+      - name: Create artifact
+        run: |
+          mkdir -p /tmp/artifacts
+          
+          SOURCE_BINARY="$TOR_SRC/src/app/tor"
+          ARTIFACT_NAME="tor-${TOR_VERSION}-openwrt-aarch64-musl-dynamic"
+          ARTIFACT_PATH="/tmp/artifacts/${ARTIFACT_NAME}"
+          
+          cp "$SOURCE_BINARY" "$ARTIFACT_PATH"
+          
+          # Verify copy
+          if [ ! -f "$ARTIFACT_PATH" ]; then
+            echo "Error: Failed to copy binary to artifacts"
+            exit 1
+          fi
+          
+          echo "=== Artifact Ready ==="
+          ls -lh "$ARTIFACT_PATH"
+          file "$ARTIFACT_PATH"
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tor-openwrt-aarch64-musl-dynamic
+          path: /tmp/artifacts/
+          retention-days: 30
+          if-no-files-found: error
